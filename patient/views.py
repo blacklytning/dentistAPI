@@ -1,19 +1,17 @@
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework import permissions
-from rest_framework.response import Response
-from rest_framework import status
-from django.db import IntegrityError
 import datetime
-from django.http import HttpResponse
 
-from authentication import models as auth
+from django.db import IntegrityError
+from django.http import HttpResponse
+from rest_framework import permissions, status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.response import Response
+
 import authentication.jsonwebtokens as jsonwebtokens
 import authentication.validation as validation
-from .serializers import DetailsSerializer, ComplaintSerializer
-from . import serializers
-from . import models
-from . import services
-from . import utils
+from authentication import models as auth
+
+from . import models, serializers, services, utils
+from .serializers import ComplaintSerializer, DetailsSerializer
 
 
 @api_view(["GET"])
@@ -84,10 +82,11 @@ def patients(request, phonenumber=None, name=None):
     return Response({"patients": all_patients}, status=status.HTTP_200_OK)
 
 
-@api_view(["POST"])
+@api_view(["GET", "POST"])
 @permission_classes((permissions.AllowAny,))
 def details(request):
     """
+    POST:
     Expected JSON
         "phonenumber": "7880589921"
         "details": {
@@ -99,19 +98,16 @@ def details(request):
 
     - create a user object first
     - create details object first
+    GET:
+        Returns patient details. Requires Authorization header with admin role.
     """
     if request.method == "POST":
-        # Make sure user is admin
         token, error = jsonwebtokens.is_authorized(
             request.headers["Authorization"].split(" ")[1], set(["admin"])
         )
         if error:
-            return Response(
-                {"error": error},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
+            return Response({"error": error}, status=status.HTTP_401_UNAUTHORIZED)
 
-        # Case 2
         phonenumber = request.data.get("phonenumber")
         is_valid_phonenumber: validation.FieldValidity = (
             validation.validate_phonenumber(int(phonenumber))
@@ -126,7 +122,7 @@ def details(request):
         try:
             user_object = auth.User.objects.create(
                 phonenumber=phonenumber,
-                name=services.capitalize_name(request.data.get("details").get("name")),
+                name=services.capitalize_name(request.data["details"]["name"]),
                 role="patient",
                 password="",
             )
@@ -138,21 +134,49 @@ def details(request):
 
         serializer = DetailsSerializer(data=request.data.get("details"))
         if not serializer.is_valid():
-            return Response(
-                serializer.error_messages, status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         models.Details.objects.create(
             id=user_object,
-            date_of_birth=serializer.data["date_of_birth"],
-            address=serializer.data["address"],
-            gender=serializer.data["gender"],
+            date_of_birth=serializer.validated_data["date_of_birth"],
+            address=serializer.validated_data["address"],
+            gender=serializer.validated_data["gender"],
         )
 
-        # get role
         return Response(
             {"message": "Details have been registered"}, status=status.HTTP_200_OK
         )
+
+    elif request.method == "GET":
+        try:
+            token = request.headers["Authorization"].split(" ")[1]
+        except (KeyError, IndexError):
+            return Response({"error": "Authorization token missing"}, status=401)
+
+        payload, error = jsonwebtokens.is_authorized(token, set(["patient"]))
+        if error:
+            return Response({"error": error}, status=status.HTTP_401_UNAUTHORIZED)
+
+        if "phonenumber" not in payload:
+            return Response({"error": "Phone number not found in token"}, status=400)
+
+        try:
+            user = auth.User.objects.get(phonenumber=payload["phonenumber"])
+            details = models.Details.objects.get(id=user)
+            serialized = DetailsSerializer(details)
+            return Response(
+                {
+                    "phonenumber": user.phonenumber,
+                    "name": user.name,
+                    "role": user.role,
+                    "details": serialized.data,
+                },
+                status=200,
+            )
+        except auth.User.DoesNotExist:
+            return Response({"error": "User not found"}, status=404)
+        except models.Details.DoesNotExist:
+            return Response({"error": "User details not found"}, status=404)
 
 
 @api_view(["GET", "POST"])
